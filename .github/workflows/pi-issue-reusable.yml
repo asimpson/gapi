@@ -4,12 +4,22 @@ on:
   workflow_call:
     inputs:
       model:
-        description: OpenAI model ID available to Pi
+        description: OpenAI API model ID available to Pi
         type: string
-        default: gpt-5.2
+        default: gpt-6-sol
+      auth_mode:
+        description: 'api-key (default) or subscription (private repositories only)'
+        type: string
+        default: api-key
+      subscription_model:
+        description: OpenAI Codex subscription model ID available to Pi
+        type: string
+        default: gpt-6-sol
     secrets:
       OPENAI_API_KEY:
-        required: true
+        required: false
+      PI_AUTH_JSON:
+        required: false
 
 jobs:
   acknowledge:
@@ -60,15 +70,60 @@ jobs:
           fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'pi-prompt.txt'),
             `Work on the following GitHub issue in this repository. If a code change is needed, edit the working tree but do not commit, push, open a PR, or use the GitHub API. End with a concise summary and tests run. If no code change is needed, answer the issue directly.\n\nIssue #${event.issue.number}:\n${event.issue.body || '(No issue body provided. Ask for details; do not change code.)'}\n`);
           NODE
+      - name: Restore subscription credential
+        if: inputs.auth_mode == 'subscription'
+        shell: bash
+        env:
+          PI_AUTH_JSON: ${{ secrets.PI_AUTH_JSON }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+          if (!event.repository?.private) throw new Error('Subscription mode is restricted to private repositories');
+          if (!process.env.PI_AUTH_JSON) throw new Error('PI_AUTH_JSON secret is required for subscription mode');
+          const credential = JSON.parse(process.env.PI_AUTH_JSON)['openai-codex'];
+          if (credential?.type !== 'oauth' || !credential.access || !credential.refresh ||
+              !Number.isFinite(credential.expires)) {
+            throw new Error('PI_AUTH_JSON must contain an openai-codex OAuth credential');
+          }
+          // GitHub masks the JSON secret, but not necessarily its individual token fields.
+          console.log(`::add-mask::${credential.access}`);
+          console.log(`::add-mask::${credential.refresh}`);
+          const dir = path.join(process.env.RUNNER_TEMP, 'pi-agent');
+          fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+          fs.chmodSync(dir, 0o700);
+          const authPath = path.join(dir, 'auth.json');
+          fs.writeFileSync(authPath, JSON.stringify({ 'openai-codex': credential }), { mode: 0o600 });
+          fs.chmodSync(authPath, 0o600);
+          NODE
       - name: Run Pi
         shell: bash
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PI_AUTH_MODE: ${{ inputs.auth_mode }}
           PI_MODEL: ${{ inputs.model }}
+          PI_SUBSCRIPTION_MODEL: ${{ inputs.subscription_model }}
+          PI_CODING_AGENT_DIR: ${{ runner.temp }}/pi-agent
           PI_SKIP_VERSION_CHECK: '1'
           PI_TELEMETRY: '0'
         run: |
-          pi --print --provider openai --model "$PI_MODEL" --no-session \
+          case "$PI_AUTH_MODE" in
+            api-key)
+              if [[ -z "$OPENAI_API_KEY" ]]; then
+                echo 'OPENAI_API_KEY secret is required for api-key mode' >&2
+                exit 1
+              fi
+              provider=openai
+              model="$PI_MODEL"
+              ;;
+            subscription)
+              provider=openai-codex
+              model="$PI_SUBSCRIPTION_MODEL"
+              ;;
+            *) echo 'Invalid auth_mode (expected api-key or subscription)' >&2; exit 1 ;;
+          esac
+          pi --print --provider "$provider" --model "$model" --no-session \
             --no-approve --no-extensions --no-skills --no-prompt-templates \
             < "$RUNNER_TEMP/pi-prompt.txt" > "$RUNNER_TEMP/answer.md"
       - name: Package working-tree changes
