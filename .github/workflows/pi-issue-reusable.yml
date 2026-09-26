@@ -1,0 +1,163 @@
+name: Pi issue worker (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: OpenAI model ID available to Pi
+        type: string
+        default: gpt-5.2
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+
+jobs:
+  acknowledge:
+    if: >-
+      github.event_name == 'issues' &&
+      contains(github.event.issue.labels.*.name, 'pi') &&
+      (github.event.action == 'opened' ||
+       (github.event.action == 'labeled' && github.event.label.name == 'pi'))
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      # An issue's body is not an issue comment. React to the issue itself.
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssue({
+              ...context.repo,
+              issue_number: context.issue.number,
+              content: 'eyes',
+            });
+
+  agent:
+    needs: acknowledge
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      kind: ${{ steps.result.outputs.kind }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.19.0'
+      - name: Install Pi
+        run: npm install --global --ignore-scripts @earendil-works/pi-coding-agent@0.87.1
+      - name: Prepare prompt
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+          fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'pi-prompt.txt'),
+            `Work on the following GitHub issue in this repository. If a code change is needed, edit the working tree but do not commit, push, open a PR, or use the GitHub API. End with a concise summary and tests run. If no code change is needed, answer the issue directly.\n\nIssue #${event.issue.number}:\n${event.issue.body || '(No issue body provided. Ask for details; do not change code.)'}\n`);
+          NODE
+      - name: Run Pi
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PI_MODEL: ${{ inputs.model }}
+          PI_SKIP_VERSION_CHECK: '1'
+          PI_TELEMETRY: '0'
+        run: |
+          pi --print --provider openai --model "$PI_MODEL" --no-session \
+            --no-approve --no-extensions --no-skills --no-prompt-templates \
+            < "$RUNNER_TEMP/pi-prompt.txt" > "$RUNNER_TEMP/answer.md"
+      - name: Package working-tree changes
+        id: result
+        shell: bash
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'kind=answer' >> "$GITHUB_OUTPUT"
+          else
+            git diff --cached --binary --full-index > "$RUNNER_TEMP/change.patch"
+            echo 'kind=patch' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pi-result-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/answer.md
+            ${{ runner.temp }}/change.patch
+          if-no-files-found: error
+          retention-days: 1
+
+  answer:
+    needs: agent
+    if: needs.agent.outputs.kind == 'answer'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pi-result-${{ github.run_id }}
+          path: ${{ runner.temp }}/pi-result
+      - uses: actions/github-script@v7
+        env:
+          ANSWER_PATH: ${{ runner.temp }}/pi-result/answer.md
+        with:
+          script: |
+            const fs = require('node:fs');
+            const answer = fs.readFileSync(process.env.ANSWER_PATH, 'utf8').trim();
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body: (answer || 'Pi completed without a written answer.').slice(0, 60000),
+            });
+
+  pull_request:
+    needs: agent
+    if: needs.agent.outputs.kind == 'patch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: pi-result-${{ github.run_id }}
+          path: ${{ runner.temp }}/pi-result
+      - name: Apply Pi's patch
+        shell: bash
+        run: |
+          git apply --check --index "$RUNNER_TEMP/pi-result/change.patch"
+          git apply --index "$RUNNER_TEMP/pi-result/change.patch"
+      - name: Create or update pull request
+        id: pr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ github.token }}
+          base: ${{ github.event.repository.default_branch }}
+          branch: pi/issue-${{ github.event.issue.number }}
+          title: 'Pi: issue #${{ github.event.issue.number }}'
+          body: |
+            Proposed by Pi for #${{ github.event.issue.number }}.
+
+            Please review the generated changes before merging.
+      - name: Link PR on issue
+        if: steps.pr.outputs.pull-request-url != ''
+        uses: actions/github-script@v7
+        env:
+          PR_URL: ${{ steps.pr.outputs.pull-request-url }}
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body: `Pi proposed a change: ${process.env.PR_URL}`,
+            });

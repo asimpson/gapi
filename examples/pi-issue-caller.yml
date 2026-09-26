@@ -1,0 +1,27 @@
+# Copy to .github/workflows/pi-issue.yml in the consuming repository.
+name: Pi on labeled issues
+
+on:
+  issues:
+    types: [opened, labeled]
+
+concurrency:
+  group: pi-issue-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  pi:
+    if: >-
+      contains(github.event.issue.labels.*.name, 'pi') &&
+      (github.event.action == 'opened' || github.event.label.name == 'pi')
+    # Replace OWNER/REPO and REF with the repository and immutable commit SHA
+    # containing .github/workflows/pi-issue-reusable.yml.
+    uses: OWNER/REPO/.github/workflows/pi-issue-reusable.yml@REF
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    with:
+      model: gpt-5.2
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
