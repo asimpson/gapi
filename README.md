@@ -12,19 +12,22 @@ The caller grants `contents: write`, `issues: write`, and `pull-requests: write`
 
 ## Optional: ChatGPT subscription (private repositories only)
 
-Pi's OpenAI Codex subscription login uses **OAuth credentials**, not an OpenAI API key. This mode is best-effort for unattended CI, not a permanent subscription API key:
+Pi's **Sign in with ChatGPT** uses OAuth credentials on the `openai` provider, not an OpenAI API key or the legacy `openai-codex` login. This workflow pins Pi `1.1.0`. Subscription mode is best-effort for unattended CI, not a permanent subscription API key:
 
-1. Sign in to **OpenAI Codex (subscription)** with `/login` in Pi locally. From your local `~/.pi/agent/auth.json`, make a JSON object with **only** the `openai-codex` top-level entry, leaving its value unchanged (including `type`, `access`, `refresh`, `expires`, and any other fields). Don't copy your entire `auth.json`. Save that JSON as the private consuming repository's Actions secret `PI_AUTH_JSON`. Never commit or paste the credentials into an issue, logs, or a PR.
-2. In your copy of `examples/pi-issue-caller.yml`, change the job's inputs and secrets to:
+1. Install the matching Pi version locally with `npm install --global --ignore-scripts @earendil-works/pi-coding-agent@1.1.0`. Start Pi, run `/login openai`, and choose **Sign in with ChatGPT**, not the API-key option. Complete the browser sign-in.
+2. From your local `~/.pi/agent/auth.json` (or `$PI_CODING_AGENT_DIR/auth.json` if overridden), make a JSON object with **only** the `openai` top-level entry, leaving its value unchanged. It must have `type: "oauth"`, `access`, `refresh`, `expires`, `clientId`, and `scopes` including `chatgpt.tokens.use.direct`. Keep any additional fields too. The issued `clientId` is required for refresh; these credentials cannot be reconstructed from the old Codex login. Don't copy your entire `auth.json`. Save that JSON as the private consuming repository's Actions secret `PI_AUTH_JSON`. Never commit or paste the credentials into an issue, logs, or a PR.
+3. In your copy of `examples/pi-issue-caller.yml`, change the job's inputs and secrets to:
 
    ```yaml
    with:
      auth_mode: subscription
-     subscription_model: gpt-5.5 # or a model offered by your subscription
+     subscription_model: gpt-6-sol # or an OpenAI model offered by your subscription
    secrets:
      PI_AUTH_JSON: ${{ secrets.PI_AUTH_JSON }}
    ```
 
-The workflow rejects subscription mode in public repositories. It restores the credential to a private temporary Pi config directory and selects `openai-codex`. OAuth access tokens expire; Pi may refresh them during a run, but refreshed credentials are **not** saved back to the GitHub secret. If refresh tokens rotate, a later run can fail: log in locally again and update `PI_AUTH_JSON`. Service availability and terms may also change. API-key mode (`auth_mode: api-key`) remains the default and needs only `OPENAI_API_KEY`.
+**Migrating from the old workflow:** Sign in again using `/login openai` and **Sign in with ChatGPT**, then replace `PI_AUTH_JSON` with the new `openai` entry. Do **not** rename an `openai-codex` entry to `openai`: the OAuth client and grant are different. Update the consuming workflow's pinned commit SHA to the version containing this migration.
+
+The workflow rejects subscription mode in public repositories. It validates the required credential fields and scope, restores only the `openai` credential to a private temporary Pi config directory, and selects `openai`. It unsets `OPENAI_API_KEY` in subscription mode, so it does not fall back to API-key billing. OAuth access tokens expire; Pi may refresh them during a run, but refreshed credentials are **not** saved back to the GitHub secret. Rotating refresh tokens can invalidate the original secret; concurrent runs or local sessions sharing that credential can also conflict. Log in locally again and update `PI_AUTH_JSON` when this happens. Service availability, subscription eligibility, usage limits, and terms may also change. API-key mode (`auth_mode: api-key`) remains the default and needs only `OPENAI_API_KEY`.
 
 **Security:** Issue content, repository files, and Pi-generated changes are untrusted. Pi can run shell commands and read its API key or OAuth credentials during its step; a separate publishing job prevents it from directly using write credentials, but does not make the agent sandboxed. Private repositories do **not** protect credentials from a malicious issue or repository instruction. Only label issues you are willing to fund and process, and review PRs before merging. The publisher never runs the generated code, but a repository's other workflows might. Generated PRs created with `GITHUB_TOKEN` do not trigger most other workflows; use a reviewed GitHub App token if PR CI must run automatically. The workflow fails rather than posting partial results if Pi or patch application fails; inspect the Actions run in that case.

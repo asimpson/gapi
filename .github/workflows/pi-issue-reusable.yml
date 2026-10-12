@@ -12,7 +12,7 @@ on:
         type: string
         default: api-key
       subscription_model:
-        description: OpenAI Codex subscription model ID available to Pi
+        description: OpenAI model ID available through Sign in with ChatGPT
         type: string
         default: gpt-6-sol
     secrets:
@@ -59,7 +59,7 @@ jobs:
         with:
           node-version: '22.19.0'
       - name: Install Pi
-        run: npm install --global --ignore-scripts @earendil-works/pi-coding-agent@0.87.1
+        run: npm install --global --ignore-scripts @earendil-works/pi-coding-agent@1.1.0
       - name: Prepare prompt
         shell: bash
         run: |
@@ -82,10 +82,24 @@ jobs:
           const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
           if (!event.repository?.private) throw new Error('Subscription mode is restricted to private repositories');
           if (!process.env.PI_AUTH_JSON) throw new Error('PI_AUTH_JSON secret is required for subscription mode');
-          const credential = JSON.parse(process.env.PI_AUTH_JSON)['openai-codex'];
-          if (credential?.type !== 'oauth' || !credential.access || !credential.refresh ||
-              !Number.isFinite(credential.expires)) {
-            throw new Error('PI_AUTH_JSON must contain an openai-codex OAuth credential');
+          let auth;
+          try {
+            auth = JSON.parse(process.env.PI_AUTH_JSON);
+          } catch {
+            // JSON parser errors can quote credentials from the secret.
+            throw new Error('PI_AUTH_JSON must be valid JSON containing the openai OAuth entry from Pi');
+          }
+          const credential = auth?.openai;
+          if (!credential && auth?.['openai-codex']) {
+            throw new Error('Legacy openai-codex credentials are not supported here. Use /login openai, choose Sign in with ChatGPT, and replace PI_AUTH_JSON; do not rename the old entry.');
+          }
+          const nonEmptyString = value => typeof value === 'string' && value.trim().length > 0;
+          if (credential?.type !== 'oauth' || !nonEmptyString(credential.access) ||
+              !nonEmptyString(credential.refresh) || !Number.isFinite(credential.expires) ||
+              !nonEmptyString(credential.clientId) || !Array.isArray(credential.scopes) ||
+              !credential.scopes.every(nonEmptyString) ||
+              !credential.scopes.includes('chatgpt.tokens.use.direct')) {
+            throw new Error('PI_AUTH_JSON must contain an openai OAuth credential with access, refresh, expires, clientId, and scopes granting chatgpt.tokens.use.direct. Use /login openai and choose Sign in with ChatGPT.');
           }
           // GitHub masks the JSON secret, but not necessarily its individual token fields.
           console.log(`::add-mask::${credential.access}`);
@@ -94,7 +108,8 @@ jobs:
           fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
           fs.chmodSync(dir, 0o700);
           const authPath = path.join(dir, 'auth.json');
-          fs.writeFileSync(authPath, JSON.stringify({ 'openai-codex': credential }), { mode: 0o600 });
+          // Preserve clientId, scopes, and any future fields needed by Pi's refresh flow.
+          fs.writeFileSync(authPath, JSON.stringify({ openai: credential }), { mode: 0o600 });
           fs.chmodSync(authPath, 0o600);
           NODE
       - name: Run Pi
@@ -118,7 +133,9 @@ jobs:
               model="$PI_MODEL"
               ;;
             subscription)
-              provider=openai-codex
+              # Do not expose an API key or allow API billing in subscription mode.
+              unset OPENAI_API_KEY
+              provider=openai
               model="$PI_SUBSCRIPTION_MODEL"
               ;;
             *) echo 'Invalid auth_mode (expected api-key or subscription)' >&2; exit 1 ;;
