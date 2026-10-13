@@ -20,6 +20,8 @@ on:
         required: false
       PI_AUTH_JSON:
         required: false
+      PI_AUTH_JSON_UPDATE_TOKEN:
+        required: false
 
 jobs:
   acknowledge:
@@ -46,6 +48,11 @@ jobs:
     needs: acknowledge
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    concurrency:
+      # OpenAI OAuth refresh tokens can rotate; do not let two subscription runs
+      # race on the same repository secret.
+      group: pi-agent-${{ github.repository }}-${{ inputs.auth_mode == 'subscription' && 'subscription' || github.run_id }}
+      cancel-in-progress: false
     permissions:
       contents: read
     outputs:
@@ -108,9 +115,14 @@ jobs:
           fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
           fs.chmodSync(dir, 0o700);
           const authPath = path.join(dir, 'auth.json');
+          const content = JSON.stringify({ openai: credential });
           // Preserve clientId, scopes, and any future fields needed by Pi's refresh flow.
-          fs.writeFileSync(authPath, JSON.stringify({ openai: credential }), { mode: 0o600 });
+          fs.writeFileSync(authPath, content, { mode: 0o600 });
           fs.chmodSync(authPath, 0o600);
+          // Keep the original value locally so a later step can detect OAuth rotation.
+          const initialPath = path.join(dir, 'auth.initial.json');
+          fs.writeFileSync(initialPath, content, { mode: 0o600 });
+          fs.chmodSync(initialPath, 0o600);
           NODE
       - name: Run Pi
         shell: bash
@@ -140,9 +152,93 @@ jobs:
               ;;
             *) echo 'Invalid auth_mode (expected api-key or subscription)' >&2; exit 1 ;;
           esac
+          pi_stderr="$RUNNER_TEMP/pi-stderr.log"
+          set +e
           pi --print --provider "$provider" --model "$model" --no-session \
             --no-approve --no-extensions --no-skills --no-prompt-templates \
-            < "$RUNNER_TEMP/pi-prompt.txt" > "$RUNNER_TEMP/answer.md"
+            < "$RUNNER_TEMP/pi-prompt.txt" > "$RUNNER_TEMP/answer.md" \
+            2> >(tee "$pi_stderr" >&2)
+          status=$?
+          set -e
+          if [[ $status -ne 0 ]]; then
+            if grep -q 'OAuth refresh failed' "$pi_stderr" && grep -q 'invalid_grant' "$pi_stderr"; then
+              {
+                echo 'OpenAI OAuth refresh failed with invalid_grant.'
+                echo 'The PI_AUTH_JSON secret contains a stale or rotated refresh token.'
+                echo 'Re-run /login openai with Sign in with ChatGPT and replace PI_AUTH_JSON, or pass PI_AUTH_JSON_UPDATE_TOKEN so this workflow can persist refreshed credentials.'
+              } >&2
+            fi
+            exit "$status"
+          fi
+      - name: Persist refreshed subscription credential
+        if: always() && inputs.auth_mode == 'subscription'
+        shell: bash
+        env:
+          PI_AUTH_JSON_UPDATE_TOKEN: ${{ secrets.PI_AUTH_JSON_UPDATE_TOKEN }}
+        run: |
+          auth_path="$RUNNER_TEMP/pi-agent/auth.json"
+          initial_path="$RUNNER_TEMP/pi-agent/auth.initial.json"
+          changed_path="$RUNNER_TEMP/pi-auth-changed"
+          AUTH_PATH="$auth_path" INITIAL_AUTH_PATH="$initial_path" CHANGED_PATH="$changed_path" node <<'NODE'
+          const fs = require('node:fs');
+
+          const authPath = process.env.AUTH_PATH;
+          const initialPath = process.env.INITIAL_AUTH_PATH;
+          const changedPath = process.env.CHANGED_PATH;
+          const nonEmptyString = value => typeof value === 'string' && value.trim().length > 0;
+          const writeChanged = changed => fs.writeFileSync(changedPath, changed ? 'true' : 'false');
+          const readJson = file => {
+            try {
+              return JSON.parse(fs.readFileSync(file, 'utf8'));
+            } catch (error) {
+              console.log(`::warning::Could not inspect ${file} for OAuth rotation: ${error.message}`);
+              return undefined;
+            }
+          };
+
+          if (!fs.existsSync(authPath) || !fs.existsSync(initialPath)) {
+            writeChanged(false);
+            process.exit(0);
+          }
+
+          const current = readJson(authPath)?.openai;
+          const initial = readJson(initialPath)?.openai;
+          for (const token of [current?.access, current?.refresh]) {
+            if (nonEmptyString(token)) console.log(`::add-mask::${token}`);
+          }
+
+          if (current?.type !== 'oauth' || !nonEmptyString(current.access) ||
+              !nonEmptyString(current.refresh) || !Number.isFinite(current.expires) ||
+              !nonEmptyString(current.clientId) || !Array.isArray(current.scopes)) {
+            console.log('::warning::Pi auth file no longer contains a valid openai OAuth credential; not updating PI_AUTH_JSON.');
+            writeChanged(false);
+            process.exit(0);
+          }
+
+          // Store only the expected openai credential, even if the auth file gained other entries.
+          fs.writeFileSync(authPath, JSON.stringify({ openai: current }), { mode: 0o600 });
+          fs.chmodSync(authPath, 0o600);
+
+          const changed = Boolean(initial) &&
+            (current.access !== initial.access ||
+             current.refresh !== initial.refresh ||
+             current.expires !== initial.expires);
+          writeChanged(changed);
+          NODE
+
+          changed="$(< "$changed_path")"
+          if [[ "$changed" != 'true' ]]; then
+            exit 0
+          fi
+
+          if [[ -z "$PI_AUTH_JSON_UPDATE_TOKEN" ]]; then
+            echo '::warning::Pi refreshed OAuth credentials, but PI_AUTH_JSON_UPDATE_TOKEN was not provided. Update the PI_AUTH_JSON secret from a fresh local /login before the next subscription run; otherwise refresh can fail with invalid_grant.'
+            exit 0
+          fi
+
+          GH_TOKEN="$PI_AUTH_JSON_UPDATE_TOKEN" gh secret set PI_AUTH_JSON \
+            --repo "$GITHUB_REPOSITORY" \
+            --body-file "$auth_path"
       - name: Package working-tree changes
         id: result
         shell: bash

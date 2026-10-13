@@ -25,3 +25,7 @@ jobs:
       model: gpt-5.2
     secrets:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      # For auth_mode: subscription, pass PI_AUTH_JSON instead of OPENAI_API_KEY.
+      # PI_AUTH_JSON: ${{ secrets.PI_AUTH_JSON }}
+      # Optional: lets the reusable workflow persist rotated OAuth credentials.
+      # PI_AUTH_JSON_UPDATE_TOKEN: ${{ secrets.PI_AUTH_JSON_UPDATE_TOKEN }}
