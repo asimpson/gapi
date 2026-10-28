@@ -49,8 +49,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:
-      # OpenAI OAuth refresh tokens can rotate; do not let two subscription runs
-      # race on the same repository secret.
+      # A subscription refresh rotates the refresh token and saves it to
+      # PI_AUTH_JSON. Secrets are read when a job starts, so serialize these jobs
+      # to make each one start with the latest saved credential.
       group: pi-agent-${{ github.repository }}-${{ inputs.auth_mode == 'subscription' && 'subscription' || github.run_id }}
       cancel-in-progress: false
     permissions:
@@ -77,52 +78,159 @@ jobs:
           fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'pi-prompt.txt'),
             `Work on the following GitHub issue in this repository. If a code change is needed, edit the working tree but do not commit, push, open a PR, or use the GitHub API. End with a concise summary and tests run. If no code change is needed, answer the issue directly.\n\nIssue #${event.issue.number}:\n${event.issue.body || '(No issue body provided. Ask for details; do not change code.)'}\n`);
           NODE
-      - name: Restore subscription credential
+      - name: Prepare subscription credential
         if: inputs.auth_mode == 'subscription'
         shell: bash
         env:
           PI_AUTH_JSON: ${{ secrets.PI_AUTH_JSON }}
+          PI_AUTH_JSON_UPDATE_TOKEN: ${{ secrets.PI_AUTH_JSON_UPDATE_TOKEN }}
         run: |
           node <<'NODE'
+          const { execFileSync } = require('node:child_process');
           const fs = require('node:fs');
           const path = require('node:path');
-          const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
-          if (!event.repository?.private) throw new Error('Subscription mode is restricted to private repositories');
-          if (!process.env.PI_AUTH_JSON) throw new Error('PI_AUTH_JSON secret is required for subscription mode');
-          let auth;
-          try {
-            auth = JSON.parse(process.env.PI_AUTH_JSON);
-          } catch {
-            // JSON parser errors can quote credentials from the secret.
-            throw new Error('PI_AUTH_JSON must be valid JSON containing the openai OAuth entry from Pi');
-          }
-          const credential = auth?.openai;
-          if (!credential && auth?.['openai-codex']) {
-            throw new Error('Legacy openai-codex credentials are not supported here. Use /login openai, choose Sign in with ChatGPT, and replace PI_AUTH_JSON; do not rename the old entry.');
-          }
+
+          // Mirrors the Sign in with ChatGPT refresh in the pinned Pi version; update both together.
+          const TOKEN_URL = 'https://auth.openai.com/api/accounts/oauth/token';
+          const RESOURCE = 'https://api.openai.com/v1';
+          const DIRECT_TOKEN_SCOPE = 'chatgpt.tokens.use.direct';
+          const EXPIRY_MARGIN_MS = 3 * 60 * 1000;
+          // Longer than the job's 30-minute timeout plus Pi's 5-minute refresh margin,
+          // so Pi never needs to refresh during the run.
+          const MIN_VALIDITY_MS = 40 * 60 * 1000;
+
           const nonEmptyString = value => typeof value === 'string' && value.trim().length > 0;
-          if (credential?.type !== 'oauth' || !nonEmptyString(credential.access) ||
-              !nonEmptyString(credential.refresh) || !Number.isFinite(credential.expires) ||
-              !nonEmptyString(credential.clientId) || !Array.isArray(credential.scopes) ||
-              !credential.scopes.every(nonEmptyString) ||
-              !credential.scopes.includes('chatgpt.tokens.use.direct')) {
-            throw new Error('PI_AUTH_JSON must contain an openai OAuth credential with access, refresh, expires, clientId, and scopes granting chatgpt.tokens.use.direct. Use /login openai and choose Sign in with ChatGPT.');
+          const mask = value => {
+            if (nonEmptyString(value)) console.log(`::add-mask::${value}`);
+          };
+
+          function gh(args, input) {
+            try {
+              execFileSync('gh', args, {
+                input,
+                env: { ...process.env, GH_TOKEN: process.env.PI_AUTH_JSON_UPDATE_TOKEN },
+                stdio: ['pipe', 'ignore', 'pipe'],
+              });
+            } catch (error) {
+              throw new Error(error.stderr?.toString().trim() || error.message);
+            }
           }
-          // GitHub masks the JSON secret, but not necessarily its individual token fields.
-          console.log(`::add-mask::${credential.access}`);
-          console.log(`::add-mask::${credential.refresh}`);
-          const dir = path.join(process.env.RUNNER_TEMP, 'pi-agent');
-          fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-          fs.chmodSync(dir, 0o700);
-          const authPath = path.join(dir, 'auth.json');
-          const content = JSON.stringify({ openai: credential });
-          // Preserve clientId, scopes, and any future fields needed by Pi's refresh flow.
-          fs.writeFileSync(authPath, content, { mode: 0o600 });
-          fs.chmodSync(authPath, 0o600);
-          // Keep the original value locally so a later step can detect OAuth rotation.
-          const initialPath = path.join(dir, 'auth.initial.json');
-          fs.writeFileSync(initialPath, content, { mode: 0o600 });
-          fs.chmodSync(initialPath, 0o600);
+
+          async function refresh(credential) {
+            const response = await fetch(TOKEN_URL, {
+              method: 'POST',
+              headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' },
+              body: new URLSearchParams({
+                grant_type: 'refresh_token',
+                client_id: credential.clientId,
+                refresh_token: credential.refresh,
+                resource: RESOURCE,
+              }),
+            });
+            const text = await response.text();
+            let token;
+            try {
+              token = JSON.parse(text);
+            } catch {}
+            mask(token?.access_token);
+            mask(token?.refresh_token);
+            mask(token?.id_token);
+            if (!response.ok) {
+              throw new Error(`OpenAI rejected the refresh token in PI_AUTH_JSON (${response.status}): ${text || response.statusText}. ` +
+                'Each refresh token works once, so another Pi install sharing this sign-in or an earlier refresh that was not saved has used it, or it expired. ' +
+                'Create a dedicated sign-in for this workflow and replace PI_AUTH_JSON.');
+            }
+            if (!nonEmptyString(token?.access_token) || !nonEmptyString(token.refresh_token) ||
+                !nonEmptyString(token.scope) || !Number.isFinite(token.expires_in) || token.expires_in <= 0) {
+              throw new Error('OpenAI returned an unexpected token response, so the stored refresh token may be used up. Sign in again and replace PI_AUTH_JSON.');
+            }
+            const scopes = token.scope.trim().split(/\s+/);
+            if (!scopes.includes(DIRECT_TOKEN_SCOPE)) {
+              throw new Error(`The refreshed OpenAI credential lacks ${DIRECT_TOKEN_SCOPE}. Sign in again with Sign in with ChatGPT and replace PI_AUTH_JSON.`);
+            }
+            return {
+              type: 'oauth',
+              access: token.access_token,
+              refresh: token.refresh_token,
+              expires: Date.now() + token.expires_in * 1000 - EXPIRY_MARGIN_MS,
+              clientId: credential.clientId,
+              scopes,
+            };
+          }
+
+          async function main() {
+            const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+            if (!event.repository?.private) throw new Error('Subscription mode is restricted to private repositories');
+            if (!process.env.PI_AUTH_JSON) throw new Error('PI_AUTH_JSON secret is required for subscription mode');
+            let auth;
+            try {
+              auth = JSON.parse(process.env.PI_AUTH_JSON);
+            } catch {
+              // JSON parser errors can quote credentials from the secret.
+              throw new Error('PI_AUTH_JSON must be valid JSON containing the openai OAuth entry from Pi');
+            }
+            let credential = auth?.openai;
+            if (!credential && auth?.['openai-codex']) {
+              throw new Error('Legacy openai-codex credentials are not supported here. Use /login openai, choose Sign in with ChatGPT, and replace PI_AUTH_JSON; do not rename the old entry.');
+            }
+            if (credential?.type !== 'oauth' || !nonEmptyString(credential.access) ||
+                !nonEmptyString(credential.refresh) || !Number.isFinite(credential.expires) ||
+                !nonEmptyString(credential.clientId) || !Array.isArray(credential.scopes) ||
+                !credential.scopes.every(nonEmptyString) ||
+                !credential.scopes.includes(DIRECT_TOKEN_SCOPE)) {
+              throw new Error('PI_AUTH_JSON must contain an openai OAuth credential with access, refresh, expires, clientId, and scopes granting chatgpt.tokens.use.direct. Use /login openai and choose Sign in with ChatGPT.');
+            }
+            // GitHub masks the JSON secret, but not necessarily its individual token fields.
+            mask(credential.access);
+            mask(credential.refresh);
+
+            const updateToken = nonEmptyString(process.env.PI_AUTH_JSON_UPDATE_TOKEN);
+            if (credential.expires - Date.now() < MIN_VALIDITY_MS) {
+              if (!updateToken) {
+                throw new Error('The OpenAI access token in PI_AUTH_JSON needs a refresh, which rotates the refresh token, so PI_AUTH_JSON_UPDATE_TOKEN is required to save the result. PI_AUTH_JSON was not refreshed and is unchanged; set PI_AUTH_JSON_UPDATE_TOKEN and re-run.');
+              }
+              // A refresh token works once. Confirm the result can be saved before spending it.
+              try {
+                gh(['api', `repos/${process.env.GITHUB_REPOSITORY}/actions/secrets/public-key`]);
+              } catch (error) {
+                throw new Error(`PI_AUTH_JSON_UPDATE_TOKEN cannot write this repository's Actions secrets (${error.message}). PI_AUTH_JSON was not refreshed and is unchanged.`);
+              }
+              credential = await refresh(credential);
+              const content = JSON.stringify({ openai: credential });
+              for (let attempt = 1; ; attempt++) {
+                try {
+                  gh(['secret', 'set', 'PI_AUTH_JSON', '--repo', process.env.GITHUB_REPOSITORY], content);
+                  break;
+                } catch (error) {
+                  if (attempt === 3) {
+                    throw new Error(`Refreshed the OpenAI credential but could not save it to PI_AUTH_JSON (${error.message}). OpenAI has already rotated the refresh token, so sign in again and replace PI_AUTH_JSON.`);
+                  }
+                  await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+                }
+              }
+              console.log('Refreshed the OpenAI OAuth credential and saved it to PI_AUTH_JSON.');
+              if (credential.expires - Date.now() < MIN_VALIDITY_MS) {
+                console.log('::warning::The refreshed OpenAI access token expires within 40 minutes; Pi cannot refresh it, so a long run can fail.');
+              }
+            } else if (!updateToken) {
+              const expires = new Date(credential.expires).toISOString();
+              console.log(`::warning::PI_AUTH_JSON_UPDATE_TOKEN is not set. The OpenAI access token expires at ${expires}; runs after that will fail until it is set.`);
+            }
+
+            const dir = path.join(process.env.RUNNER_TEMP, 'pi-agent');
+            fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+            fs.chmodSync(dir, 0o700);
+            const authPath = path.join(dir, 'auth.json');
+            // Pi gets only the access token, which outlasts this job. Withholding the
+            // refresh token means Pi never rotates the credential saved in PI_AUTH_JSON.
+            fs.writeFileSync(authPath, JSON.stringify({ openai: { ...credential, refresh: '' } }), { mode: 0o600 });
+            fs.chmodSync(authPath, 0o600);
+          }
+
+          main().catch(error => {
+            console.error(error.message);
+            process.exit(1);
+          });
           NODE
       - name: Run Pi
         shell: bash
@@ -161,84 +269,11 @@ jobs:
           status=$?
           set -e
           if [[ $status -ne 0 ]]; then
-            if grep -q 'OAuth refresh failed' "$pi_stderr" && grep -q 'invalid_grant' "$pi_stderr"; then
-              {
-                echo 'OpenAI OAuth refresh failed with invalid_grant.'
-                echo 'The PI_AUTH_JSON secret contains a stale or rotated refresh token.'
-                echo 'Re-run /login openai with Sign in with ChatGPT and replace PI_AUTH_JSON, or pass PI_AUTH_JSON_UPDATE_TOKEN so this workflow can persist refreshed credentials.'
-              } >&2
+            if grep -q 'OAuth refresh failed' "$pi_stderr"; then
+              echo 'The OpenAI access token expired during the run. Pi does not get the refresh token; re-run the job to refresh it first.' >&2
             fi
             exit "$status"
           fi
-      - name: Persist refreshed subscription credential
-        if: always() && inputs.auth_mode == 'subscription'
-        shell: bash
-        env:
-          PI_AUTH_JSON_UPDATE_TOKEN: ${{ secrets.PI_AUTH_JSON_UPDATE_TOKEN }}
-        run: |
-          auth_path="$RUNNER_TEMP/pi-agent/auth.json"
-          initial_path="$RUNNER_TEMP/pi-agent/auth.initial.json"
-          changed_path="$RUNNER_TEMP/pi-auth-changed"
-          AUTH_PATH="$auth_path" INITIAL_AUTH_PATH="$initial_path" CHANGED_PATH="$changed_path" node <<'NODE'
-          const fs = require('node:fs');
-
-          const authPath = process.env.AUTH_PATH;
-          const initialPath = process.env.INITIAL_AUTH_PATH;
-          const changedPath = process.env.CHANGED_PATH;
-          const nonEmptyString = value => typeof value === 'string' && value.trim().length > 0;
-          const writeChanged = changed => fs.writeFileSync(changedPath, changed ? 'true' : 'false');
-          const readJson = file => {
-            try {
-              return JSON.parse(fs.readFileSync(file, 'utf8'));
-            } catch (error) {
-              console.log(`::warning::Could not inspect ${file} for OAuth rotation: ${error.message}`);
-              return undefined;
-            }
-          };
-
-          if (!fs.existsSync(authPath) || !fs.existsSync(initialPath)) {
-            writeChanged(false);
-            process.exit(0);
-          }
-
-          const current = readJson(authPath)?.openai;
-          const initial = readJson(initialPath)?.openai;
-          for (const token of [current?.access, current?.refresh]) {
-            if (nonEmptyString(token)) console.log(`::add-mask::${token}`);
-          }
-
-          if (current?.type !== 'oauth' || !nonEmptyString(current.access) ||
-              !nonEmptyString(current.refresh) || !Number.isFinite(current.expires) ||
-              !nonEmptyString(current.clientId) || !Array.isArray(current.scopes)) {
-            console.log('::warning::Pi auth file no longer contains a valid openai OAuth credential; not updating PI_AUTH_JSON.');
-            writeChanged(false);
-            process.exit(0);
-          }
-
-          // Store only the expected openai credential, even if the auth file gained other entries.
-          fs.writeFileSync(authPath, JSON.stringify({ openai: current }), { mode: 0o600 });
-          fs.chmodSync(authPath, 0o600);
-
-          const changed = Boolean(initial) &&
-            (current.access !== initial.access ||
-             current.refresh !== initial.refresh ||
-             current.expires !== initial.expires);
-          writeChanged(changed);
-          NODE
-
-          changed="$(< "$changed_path")"
-          if [[ "$changed" != 'true' ]]; then
-            exit 0
-          fi
-
-          if [[ -z "$PI_AUTH_JSON_UPDATE_TOKEN" ]]; then
-            echo '::warning::Pi refreshed OAuth credentials, but PI_AUTH_JSON_UPDATE_TOKEN was not provided. Update the PI_AUTH_JSON secret from a fresh local /login before the next subscription run; otherwise refresh can fail with invalid_grant.'
-            exit 0
-          fi
-
-          GH_TOKEN="$PI_AUTH_JSON_UPDATE_TOKEN" gh secret set PI_AUTH_JSON \
-            --repo "$GITHUB_REPOSITORY" \
-            --body-file "$auth_path"
       - name: Package working-tree changes
         id: result
         shell: bash
